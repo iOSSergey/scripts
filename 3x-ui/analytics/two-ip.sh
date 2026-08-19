@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly DB_PATH="/etc/x-ui/x-ui.db"
+readonly DB_PATH="${XUI_DB_PATH:-/etc/x-ui/x-ui.db}"
 readonly DEFAULT_MIN_IPS=2
+readonly DEFAULT_THRESHOLD_SECONDS=120
 readonly ANALYTICS_TZ_OFFSET="+3 hours"
 
 usage() {
@@ -10,12 +11,15 @@ usage() {
 Usage:
   ./two-ip.sh
   ./two-ip.sh --min-ips N
+  ./two-ip.sh --threshold SECONDS
   ./two-ip.sh --clear
-  ./two-ip.sh --sample SECONDS [--min-ips N]
+  ./two-ip.sh --sample SECONDS [--min-ips N] [--threshold SECONDS]
 
 Examples:
   ./two-ip.sh
+  XUI_DB_PATH=~/Downloads/x-ui.db ./two-ip.sh
   ./two-ip.sh --min-ips 3
+  ./two-ip.sh --threshold 60
   ./two-ip.sh --clear
   ./two-ip.sh --sample 120
 USAGE
@@ -84,6 +88,7 @@ require_json_functions() {
 
 print_report() {
   local min_ips="$1"
+  local threshold_seconds="$2"
 
   sqlite3 -readonly -header -column "$DB_PATH" <<SQL
 WITH raw_ips AS (
@@ -96,7 +101,8 @@ WITH raw_ips AS (
     CASE
       WHEN json_each.type = 'object' THEN json_extract(json_each.value, '$.timestamp')
       ELSE NULL
-    END AS seen_at_epoch
+    END AS seen_at_epoch,
+    CAST(json_each.key AS INTEGER) AS source_order
   FROM inbound_client_ips,
        json_each(
          CASE
@@ -107,48 +113,65 @@ WITH raw_ips AS (
   WHERE inbound_client_ips.ips IS NOT NULL
     AND inbound_client_ips.ips != ''
 ),
-deduped_ips AS (
+valid_ips AS (
   SELECT
     email,
     ip,
-    MAX(seen_at_epoch) AS seen_at_epoch
+    CAST(seen_at_epoch AS INTEGER) AS seen_at_epoch,
+    source_order
   FROM raw_ips
   WHERE ip IS NOT NULL
     AND ip != ''
-  GROUP BY email, ip
+    AND seen_at_epoch IS NOT NULL
+),
+distinct_ip_counts AS (
+  SELECT
+    email,
+    COUNT(DISTINCT ip) AS ip_count
+  FROM valid_ips
+  GROUP BY email
 ),
 ordered_ips AS (
   SELECT
     email,
     ip,
     seen_at_epoch,
-    CASE
-      WHEN seen_at_epoch IS NULL THEN ip
-      ELSE ip || ' (' || datetime(seen_at_epoch, 'unixepoch', '${ANALYTICS_TZ_OFFSET}') || ')'
-    END AS ip_display
-  FROM deduped_ips
-  ORDER BY email, seen_at_epoch DESC, ip
+    LAG(ip) OVER (
+      PARTITION BY email
+      ORDER BY seen_at_epoch, source_order
+    ) AS previous_ip,
+    LAG(seen_at_epoch) OVER (
+      PARTITION BY email
+      ORDER BY seen_at_epoch, source_order
+    ) AS previous_seen_at_epoch
+  FROM valid_ips
 ),
-summary AS (
+suspicious_pairs AS (
   SELECT
-    email,
-    COUNT(*) AS ip_count,
-    MAX(seen_at_epoch) AS last_seen_epoch,
-    group_concat(ip_display, ', ') AS ips
+    ordered_ips.email,
+    distinct_ip_counts.ip_count,
+    ordered_ips.previous_ip,
+    ordered_ips.previous_seen_at_epoch,
+    ordered_ips.ip,
+    ordered_ips.seen_at_epoch,
+    ordered_ips.seen_at_epoch - ordered_ips.previous_seen_at_epoch AS gap_seconds
   FROM ordered_ips
-  GROUP BY email
+  JOIN distinct_ip_counts ON distinct_ip_counts.email = ordered_ips.email
+  WHERE ordered_ips.previous_ip IS NOT NULL
+    AND ordered_ips.previous_ip != ordered_ips.ip
+    AND ordered_ips.seen_at_epoch - ordered_ips.previous_seen_at_epoch BETWEEN 0 AND ${threshold_seconds}
+    AND distinct_ip_counts.ip_count >= ${min_ips}
 )
 SELECT
   email,
   ip_count,
-  CASE
-    WHEN last_seen_epoch IS NULL THEN ''
-    ELSE datetime(last_seen_epoch, 'unixepoch', '${ANALYTICS_TZ_OFFSET}')
-  END AS last_seen,
-  ips
-FROM summary
-WHERE ip_count >= ${min_ips}
-ORDER BY ip_count DESC, last_seen_epoch DESC, email;
+  previous_ip,
+  datetime(previous_seen_at_epoch, 'unixepoch', '${ANALYTICS_TZ_OFFSET}') AS previous_seen_at,
+  ip AS next_ip,
+  datetime(seen_at_epoch, 'unixepoch', '${ANALYTICS_TZ_OFFSET}') AS next_seen_at,
+  gap_seconds
+FROM suspicious_pairs
+ORDER BY gap_seconds, next_seen_at DESC, email;
 SQL
 }
 
@@ -161,6 +184,7 @@ clear_ip_log() {
 
 mode="report"
 min_ips="$DEFAULT_MIN_IPS"
+threshold_seconds="$DEFAULT_THRESHOLD_SECONDS"
 sample_seconds=""
 
 while (( $# > 0 )); do
@@ -182,6 +206,15 @@ while (( $# > 0 )); do
       fi
       mode="clear"
       shift
+      ;;
+    --threshold)
+      if (( $# < 2 )); then
+        error "missing value for --threshold"
+        usage
+        exit 1
+      fi
+      threshold_seconds="$2"
+      shift 2
       ;;
     --sample)
       if [[ "$mode" != "report" ]]; then
@@ -211,6 +244,7 @@ while (( $# > 0 )); do
 done
 
 validate_positive_integer "--min-ips" "$min_ips"
+validate_positive_integer "--threshold" "$threshold_seconds"
 
 if [[ "$mode" == "sample" ]]; then
   validate_positive_integer "--sample" "$sample_seconds"
@@ -224,7 +258,7 @@ require_json_functions
 
 case "$mode" in
   report)
-    print_report "$min_ips"
+    print_report "$min_ips" "$threshold_seconds"
     ;;
   clear)
     clear_ip_log
@@ -233,7 +267,7 @@ case "$mode" in
     clear_ip_log
     echo "Waiting ${sample_seconds} second(s) before reading fresh IP Log data..."
     sleep "$sample_seconds"
-    print_report "$min_ips"
+    print_report "$min_ips" "$threshold_seconds"
     ;;
   *)
     error "internal error: unsupported mode: $mode"

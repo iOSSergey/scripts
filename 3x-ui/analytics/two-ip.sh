@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly DB_PATH="${XUI_DB_PATH:-/etc/x-ui/x-ui.db}"
+readonly DB_PATH="/etc/x-ui/x-ui.db"
 readonly DEFAULT_MIN_IPS=2
-readonly DEFAULT_THRESHOLD_SECONDS=120
+readonly SUSPICIOUS_WINDOW_SECONDS=120
 readonly ANALYTICS_TZ_OFFSET="+3 hours"
 
 usage() {
@@ -11,15 +11,12 @@ usage() {
 Usage:
   ./two-ip.sh
   ./two-ip.sh --min-ips N
-  ./two-ip.sh --threshold SECONDS
   ./two-ip.sh --clear
-  ./two-ip.sh --sample SECONDS [--min-ips N] [--threshold SECONDS]
+  ./two-ip.sh --sample SECONDS [--min-ips N]
 
 Examples:
   ./two-ip.sh
-  XUI_DB_PATH=~/Downloads/x-ui.db ./two-ip.sh
   ./two-ip.sh --min-ips 3
-  ./two-ip.sh --threshold 60
   ./two-ip.sh --clear
   ./two-ip.sh --sample 120
 USAGE
@@ -88,7 +85,6 @@ require_json_functions() {
 
 print_report() {
   local min_ips="$1"
-  local threshold_seconds="$2"
 
   sqlite3 -readonly -header -column "$DB_PATH" <<SQL
 WITH raw_ips AS (
@@ -159,7 +155,7 @@ suspicious_pairs AS (
   JOIN distinct_ip_counts ON distinct_ip_counts.email = ordered_ips.email
   WHERE ordered_ips.previous_ip IS NOT NULL
     AND ordered_ips.previous_ip != ordered_ips.ip
-    AND ordered_ips.seen_at_epoch - ordered_ips.previous_seen_at_epoch BETWEEN 0 AND ${threshold_seconds}
+    AND ordered_ips.seen_at_epoch - ordered_ips.previous_seen_at_epoch BETWEEN 0 AND ${SUSPICIOUS_WINDOW_SECONDS}
     AND distinct_ip_counts.ip_count >= ${min_ips}
 )
 SELECT
@@ -184,7 +180,6 @@ clear_ip_log() {
 
 mode="report"
 min_ips="$DEFAULT_MIN_IPS"
-threshold_seconds="$DEFAULT_THRESHOLD_SECONDS"
 sample_seconds=""
 
 while (( $# > 0 )); do
@@ -206,15 +201,6 @@ while (( $# > 0 )); do
       fi
       mode="clear"
       shift
-      ;;
-    --threshold)
-      if (( $# < 2 )); then
-        error "missing value for --threshold"
-        usage
-        exit 1
-      fi
-      threshold_seconds="$2"
-      shift 2
       ;;
     --sample)
       if [[ "$mode" != "report" ]]; then
@@ -244,7 +230,6 @@ while (( $# > 0 )); do
 done
 
 validate_positive_integer "--min-ips" "$min_ips"
-validate_positive_integer "--threshold" "$threshold_seconds"
 
 if [[ "$mode" == "sample" ]]; then
   validate_positive_integer "--sample" "$sample_seconds"
@@ -258,7 +243,7 @@ require_json_functions
 
 case "$mode" in
   report)
-    print_report "$min_ips" "$threshold_seconds"
+    print_report "$min_ips"
     ;;
   clear)
     clear_ip_log
@@ -267,7 +252,7 @@ case "$mode" in
     clear_ip_log
     echo "Waiting ${sample_seconds} second(s) before reading fresh IP Log data..."
     sleep "$sample_seconds"
-    print_report "$min_ips" "$threshold_seconds"
+    print_report "$min_ips"
     ;;
   *)
     error "internal error: unsupported mode: $mode"

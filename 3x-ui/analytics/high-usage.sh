@@ -4,14 +4,15 @@ set -euo pipefail
 readonly DB_PATH="/etc/x-ui/x-ui.db"
 readonly ANALYTICS_TZ_OFFSET="+3 hours"
 readonly BYTES_PER_GIB=1073741824
+readonly RECENT_WINDOW_SECONDS=604800
 
 usage() {
   cat >&2 <<'USAGE'
 Usage:
   ./high-usage.sh
 
-Shows clients whose current usage traffic is above the median usage across all
-clients in the x-ui database.
+Shows clients whose current usage traffic is above the median usage among
+clients seen within the last 7 days.
 USAGE
 }
 
@@ -62,6 +63,8 @@ WITH clients AS (
     up + down AS usage_bytes,
     last_online
   FROM client_traffics
+  WHERE last_online > 0
+    AND last_online >= (CAST(strftime('%s', 'now') AS INTEGER) - ${RECENT_WINDOW_SECONDS}) * 1000
 ),
 ranked_clients AS (
   SELECT
@@ -76,7 +79,7 @@ median AS (
   WHERE row_number IN ((total_rows + 1) / 2, (total_rows + 2) / 2)
 )
 SELECT
-  COUNT(*) AS user_count,
+  COUNT(*) AS recent_user_count,
   COALESCE(SUM(usage_bytes > median_usage_bytes), 0) AS above_median_count,
   printf('%.2f GiB', median_usage_bytes / ${BYTES_PER_GIB}.0) AS median_usage,
   printf('%.2f GiB', COALESCE(MAX(usage_bytes), 0) / ${BYTES_PER_GIB}.0) AS max_usage,
@@ -91,6 +94,8 @@ WITH clients AS (
     up + down AS usage_bytes,
     last_online
   FROM client_traffics
+  WHERE last_online > 0
+    AND last_online >= (CAST(strftime('%s', 'now') AS INTEGER) - ${RECENT_WINDOW_SECONDS}) * 1000
 ),
 ranked_clients AS (
   SELECT

@@ -2,7 +2,6 @@
 set -euo pipefail
 
 readonly DB_PATH="/etc/x-ui/x-ui.db"
-readonly ONLINE_WINDOW_SECONDS=120
 readonly ANALYTICS_TZ_OFFSET="+3 hours"
 readonly BYTES_PER_GIB=1073741824
 
@@ -11,9 +10,8 @@ usage() {
 Usage:
   ./high-usage.sh
 
-Shows online clients whose current usage traffic is above the online median.
-Online clients are clients seen within the last 120 seconds from the newest
-last_online timestamp in the x-ui database.
+Shows clients whose current usage traffic is above the median usage across all
+clients in the x-ui database.
 USAGE
 }
 
@@ -56,29 +54,21 @@ require_table() {
 
 print_report() {
   sqlite3 -readonly -header -column "$DB_PATH" <<SQL
-WITH bounds AS (
-  SELECT MAX(last_online) AS max_seen_at_ms
-  FROM client_traffics
-  WHERE last_online > 0
-),
-online_clients AS (
+WITH clients AS (
   SELECT
-    client_traffics.email,
-    client_traffics.up,
-    client_traffics.down,
-    client_traffics.up + client_traffics.down AS usage_bytes,
-    client_traffics.last_online
-  FROM client_traffics, bounds
-  WHERE client_traffics.enable = 1
-    AND client_traffics.last_online > 0
-    AND client_traffics.last_online >= bounds.max_seen_at_ms - ${ONLINE_WINDOW_SECONDS} * 1000
+    email,
+    up,
+    down,
+    up + down AS usage_bytes,
+    last_online
+  FROM client_traffics
 ),
 ranked_clients AS (
   SELECT
-    online_clients.*,
+    clients.*,
     ROW_NUMBER() OVER (ORDER BY usage_bytes) AS row_number,
     COUNT(*) OVER () AS total_rows
-  FROM online_clients
+  FROM clients
 ),
 median AS (
   SELECT COALESCE(AVG(usage_bytes), 0) AS median_usage_bytes
@@ -86,36 +76,28 @@ median AS (
   WHERE row_number IN ((total_rows + 1) / 2, (total_rows + 2) / 2)
 )
 SELECT
-  COUNT(*) AS online_count,
+  COUNT(*) AS user_count,
   COALESCE(SUM(usage_bytes > median_usage_bytes), 0) AS above_median_count,
   printf('%.2f GiB', median_usage_bytes / ${BYTES_PER_GIB}.0) AS median_usage,
   printf('%.2f GiB', COALESCE(MAX(usage_bytes), 0) / ${BYTES_PER_GIB}.0) AS max_usage,
   printf('%.2f GiB', COALESCE(AVG(usage_bytes), 0) / ${BYTES_PER_GIB}.0) AS avg_usage
-FROM online_clients, median;
+FROM clients, median;
 
-WITH bounds AS (
-  SELECT MAX(last_online) AS max_seen_at_ms
-  FROM client_traffics
-  WHERE last_online > 0
-),
-online_clients AS (
+WITH clients AS (
   SELECT
-    client_traffics.email,
-    client_traffics.up,
-    client_traffics.down,
-    client_traffics.up + client_traffics.down AS usage_bytes,
-    client_traffics.last_online
-  FROM client_traffics, bounds
-  WHERE client_traffics.enable = 1
-    AND client_traffics.last_online > 0
-    AND client_traffics.last_online >= bounds.max_seen_at_ms - ${ONLINE_WINDOW_SECONDS} * 1000
+    email,
+    up,
+    down,
+    up + down AS usage_bytes,
+    last_online
+  FROM client_traffics
 ),
 ranked_clients AS (
   SELECT
-    online_clients.*,
+    clients.*,
     ROW_NUMBER() OVER (ORDER BY usage_bytes) AS row_number,
     COUNT(*) OVER () AS total_rows
-  FROM online_clients
+  FROM clients
 ),
 median AS (
   SELECT COALESCE(AVG(usage_bytes), 0) AS median_usage_bytes
@@ -128,7 +110,7 @@ SELECT
   printf('%.2f GiB', up / ${BYTES_PER_GIB}.0) AS up,
   printf('%.2f GiB', down / ${BYTES_PER_GIB}.0) AS down,
   datetime(last_online / 1000, 'unixepoch', '${ANALYTICS_TZ_OFFSET}') AS last_online
-FROM online_clients, median
+FROM clients, median
 WHERE usage_bytes > median_usage_bytes
 ORDER BY usage_bytes DESC, email;
 SQL

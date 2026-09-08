@@ -48,6 +48,8 @@ Database handling:
   Replaces the entire target database; records are not merged. Preserves these
   target settings: webPort, webBasePath, webCertFile, webKeyFile, subCertFile,
   subKeyFile, xrayTemplateConfig. Certificate files themselves are not copied.
+  If the target has no xrayTemplateConfig, the snapshot value is used as-is
+  (including an absent setting). The selected template must be a valid JSON object.
   Database schemas must match. The target is stopped during replacement.
   A backup is saved beside the target database and its path is printed.
 
@@ -59,6 +61,7 @@ Requirements:
   On this machine: bash, awk, ssh, scp, sqlite3, and standard Unix utilities.
   On source/target hosts: bash, sqlite3, and standard Unix utilities.
   On the target: sha256sum or shasum, plus Docker or systemctl.
+  Target sqlite3 must support json_valid() and json_type().
   The source user must be able to read the database and create a snapshot.
   The target user must be able to replace the database and control the service.
   The script does not invoke sudo. For unattended runs, configure SSH access
@@ -399,6 +402,13 @@ hash_schema() {
     fi
 }
 
+xray_template_valid() {
+    # No row produces empty output; a present value must be a JSON object.
+    sqlite3 "$1" "SELECT CASE WHEN json_valid(value)
+        THEN json_type(value) = 'object' ELSE 0 END
+        FROM settings WHERE key='xrayTemplateConfig';"
+}
+
 detect_target() {
     if command -v docker >/dev/null 2>&1 \
         && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER" \
@@ -465,9 +475,16 @@ NEW_SCHEMA=$(hash_schema "$NEW_DB")
     exit 1
 }
 
-XRAY_FIRST_CHAR=$(sqlite3 "$DB" "SELECT substr(value,1,1) FROM settings WHERE key='xrayTemplateConfig';")
-[ "$XRAY_FIRST_CHAR" = "{" ] || {
-    echo "ERROR: local xrayTemplateConfig is not JSON"
+XRAY_VALID=$(xray_template_valid "$DB")
+if [ -z "$XRAY_VALID" ]; then
+    echo "Target has no xrayTemplateConfig; keeping the snapshot setting as-is"
+    XRAY_VALID=$(xray_template_valid "$NEW_DB")
+    XRAY_ORIGIN="snapshot"
+else
+    XRAY_ORIGIN="target"
+fi
+[ -z "$XRAY_VALID" ] || [ "$XRAY_VALID" = "1" ] || {
+    echo "ERROR: $XRAY_ORIGIN xrayTemplateConfig is not a valid JSON object"
     exit 1
 }
 
@@ -490,8 +507,8 @@ mv "$NEW_DB" "$DB"
 sqlite3 "$DB" < "$PRESERVE_SQL"
 rm -f "$PRESERVE_SQL"
 
-XRAY_FIRST_CHAR=$(sqlite3 "$DB" "SELECT substr(value,1,1) FROM settings WHERE key='xrayTemplateConfig';")
-[ "$XRAY_FIRST_CHAR" = "{" ] || rollback_and_exit "final xrayTemplateConfig is not JSON"
+FINAL_XRAY_VALID=$(xray_template_valid "$DB")
+[ "$FINAL_XRAY_VALID" = "$XRAY_VALID" ] || rollback_and_exit "final xrayTemplateConfig is missing or is not a valid JSON object"
 
 CHECK=$(sqlite3 "$DB" "PRAGMA integrity_check;")
 [ "$CHECK" = "ok" ] || rollback_and_exit "final DB integrity check failed: $CHECK"

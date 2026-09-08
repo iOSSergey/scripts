@@ -579,7 +579,7 @@ apply_to_remote() {
     remote_snapshot="/tmp/x-ui.snapshot.apply.$(date +%F-%H%M%S).$$.db"
 
     echo "Uploading snapshot to: $target_host"
-    scp "$LOCAL_SNAPSHOT" "$target_host:$remote_snapshot"
+    scp "$LOCAL_SNAPSHOT" "$target_host:$remote_snapshot" || return $?
 
     echo "Applying snapshot on: $target_host"
     # shellcheck disable=SC2029
@@ -603,7 +603,7 @@ rollback_remote() {
 }
 
 main() {
-    local answer apply_output backup_path source_host target_dir target_host target_info
+    local answer apply_output apply_status backup_path source_host target_dir target_host target_info
     local target_mode target_db target_staging
 
     parse_args "$@"
@@ -701,7 +701,12 @@ main() {
                 apply_output="$(apply_to_local)"
             else
                 apply_output="$(apply_to_remote "$target_host")"
-            fi
+            fi || {
+                apply_status=$?
+                printf '%s\n' "$apply_output" >&2
+                echo "ERROR: snapshot apply failed (exit code: $apply_status)" >&2
+                return "$apply_status"
+            }
             echo "$apply_output"
 
             backup_path="$(printf '%s\n' "$apply_output" | awk -F 'Backup: ' '/^Backup: / {print $2}' | tail -n 1)"

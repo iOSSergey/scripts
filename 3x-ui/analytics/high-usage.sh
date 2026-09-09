@@ -13,6 +13,7 @@ Usage:
 
 Shows clients whose current usage traffic is above the median usage among
 clients seen within the last 7 days.
+Output is limited to the first 15 lines, including summary and headers.
 USAGE
 }
 
@@ -141,6 +142,7 @@ if (( $# == 1 )); then
 fi
 
 require_command sqlite3
+require_command awk
 require_sqlite_db
 require_table
-print_report
+print_report | awk 'NR <= 15'

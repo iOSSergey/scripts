@@ -157,6 +157,8 @@ if cg:
     except Exception:
         pass
 
+ss_summary = run(["ss", "-s"])
+
 
 # ============================================================
 # 2. CURRENT INBOUND ESTABLISHED :443
@@ -258,6 +260,7 @@ activity = defaultdict(lambda: {
     "udp": 0,
     "ips": Counter(),
     "dst": Counter(),
+    "last_seen": {},
 })
 
 # Supported examples:
@@ -319,6 +322,11 @@ for line in lines:
     a[proto] += 1
     a["ips"][src_ip] += 1
     a["dst"][dst] += 1
+
+    previous = a["last_seen"].get(src_ip)
+
+    if previous is None or ts > previous:
+        a["last_seen"][src_ip] = ts
 
 
 # ============================================================
@@ -420,6 +428,15 @@ print(
 
 print()
 
+print("TCP SUMMARY")
+print("-" * 110)
+
+if ss_summary:
+    print(ss_summary)
+else:
+    print("ss -s unavailable")
+
+print()
 
 # ------------------------------------------------------------
 # TOP SOURCE IPs
@@ -550,6 +567,167 @@ for email, a in top_activity[:TOP_USERS]:
 
 print()
 
+# ------------------------------------------------------------
+# SIMULTANEOUS / RECENT MULTI-IP
+# ------------------------------------------------------------
+
+print("MULTI-IP PROFILES")
+print("=" * 110)
+
+# ------------------------------------------------------------
+# A. Confirmed current ESTAB from >= 2 source IPs
+# ------------------------------------------------------------
+
+current_multi = []
+
+for email, ip_counts in live_email_ips.items():
+    if len(ip_counts) < 2:
+        continue
+
+    current_multi.append((
+        sum(ip_counts.values()),
+        email,
+        ip_counts
+    ))
+
+current_multi.sort(reverse=True)
+
+print()
+print("A. SIMULTANEOUS CURRENT MULTI-IP")
+print("-" * 110)
+
+if not current_multi:
+    print("No profile currently has confirmed ESTABLISHED connections from 2+ source IPs.")
+else:
+    for total_live, email, ip_counts in current_multi:
+
+        a = activity[email]
+
+        print()
+        print(
+            f"{email}"
+        )
+
+        print(
+            f"Confirmed current ESTAB: {total_live}"
+        )
+
+        print(
+            f"Current active IPs:      {len(ip_counts)}"
+        )
+
+        print(
+            f"Flows last {WINDOW_MINUTES}m:       "
+            f"{a['total']} "
+            f"({a['total'] / WINDOW_MINUTES:.1f}/min)"
+        )
+
+        print(
+            f"{'IP':<18} "
+            f"{'LIVE':>6} "
+            f"{'RAW-IP':>7} "
+            f"{'FLOW':>7} "
+            f"{'/MIN':>7} "
+            f"{'LAST SEEN':<19}"
+        )
+
+        for ip, live_count in ip_counts.most_common():
+
+            raw_estab = by_ip.get(ip, 0)
+            flow = a["ips"].get(ip, 0)
+
+            last_seen = a["last_seen"].get(ip)
+
+            if last_seen:
+                last_seen_s = last_seen.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            else:
+                last_seen_s = "-"
+
+            print(
+                f"{ip:<18} "
+                f"{live_count:6d} "
+                f"{raw_estab:7d} "
+                f"{flow:7d} "
+                f"{flow / WINDOW_MINUTES:7.1f} "
+                f"{last_seen_s:<19}"
+            )
+
+
+# ------------------------------------------------------------
+# B. Multiple source IPs during activity window
+# ------------------------------------------------------------
+
+recent_multi = []
+
+for email, a in activity.items():
+
+    if len(a["ips"]) < 2:
+        continue
+
+    recent_multi.append((
+        a["total"],
+        email,
+        a
+    ))
+
+recent_multi.sort(reverse=True)
+
+print()
+print("B. RECENT MULTI-IP ACTIVITY")
+print(f"   Profiles using 2+ source IPs during last {WINDOW_MINUTES} minutes")
+print("-" * 110)
+
+if not recent_multi:
+    print("No multi-IP activity in the current window.")
+else:
+
+    print(
+        f"{'FLOW':>7} "
+        f"{'/MIN':>7} "
+        f"{'IPs':>4} "
+        f"{'LIVE':>6} "
+        f"EMAIL"
+    )
+
+    for total_flow, email, a in recent_multi[:TOP_USERS]:
+
+        print(
+            f"{total_flow:7d} "
+            f"{total_flow / WINDOW_MINUTES:7.1f} "
+            f"{len(a['ips']):4d} "
+            f"{live_by_email[email]:6d} "
+            f"{email}"
+        )
+
+        for ip, flow in a["ips"].most_common():
+
+            live_on_ip = live_email_ips[email].get(
+                ip, 0
+            )
+
+            raw_estab = by_ip.get(ip, 0)
+
+            last_seen = a["last_seen"].get(ip)
+
+            if last_seen:
+                last_seen_s = last_seen.strftime(
+                    "%H:%M:%S"
+                )
+            else:
+                last_seen_s = "-"
+
+            print(
+                f"          "
+                f"{ip:<18} "
+                f"flow={flow:<5d} "
+                f"live={live_on_ip:<4d} "
+                f"raw={raw_estab:<4d} "
+                f"last={last_seen_s}"
+            )
+
+print()
 
 # ------------------------------------------------------------
 # DETAILS FOR TOP 5 CURRENT PROFILES

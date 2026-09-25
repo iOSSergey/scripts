@@ -157,7 +157,7 @@ def arguments(argv=None):
 
 @contextmanager
 def pause_controls(enabled=True):
-    """Read p/r from the terminal, independently of the log's input stream."""
+    """Read p/r/Space from the terminal, independently of the log's input stream."""
     if not enabled:
         yield None
         return
@@ -192,10 +192,10 @@ def pause_controls(enabled=True):
                 key = os.read(terminal, 1).lower()
                 if key == b"p" and not paused.is_set():
                     paused.set()
-                    print("\nПауза: записи пропускаются · r — продолжить", file=sys.stderr, flush=True)
-                elif key == b"r" and paused.is_set():
+                    print("\nPaused. New events get dropped. Hit Space when you're done staring.", file=sys.stderr, flush=True)
+                elif key in (b"r", b" ") and paused.is_set():
                     paused.clear()
-                    print("\nПродолжено", file=sys.stderr, flush=True)
+                    print("\nResumed.", file=sys.stderr, flush=True)
                 elif not key:
                     return
 

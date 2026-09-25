@@ -2,11 +2,16 @@
 """Readable, streaming Xray access logs; Python 3.8+, no pip dependencies."""
 
 import argparse
+from contextlib import contextmanager
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
+import termios
+import threading
+import tty
 import unicodedata
 import zlib
 from dataclasses import dataclass
@@ -150,8 +155,69 @@ def arguments(argv=None):
     return parser.parse_args(argv)
 
 
-def consume(stream, renderer, args):
+@contextmanager
+def pause_controls(enabled=True):
+    """Read p/r from the terminal, independently of the log's input stream."""
+    if not enabled:
+        yield None
+        return
+    try:
+        terminal = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+    except OSError:
+        yield None
+        return
+    original = None
+    try:
+        original = termios.tcgetattr(terminal)
+        tty.setcbreak(terminal)
+        wake_read, wake_write = os.pipe()
+    except OSError:
+        # Some restricted terminals do not permit changing input mode.
+        if original is not None:
+            try:
+                termios.tcsetattr(terminal, termios.TCSADRAIN, original)
+            except OSError:
+                pass
+        os.close(terminal)
+        yield None
+        return
+    paused = threading.Event()
+    worker = None
+    try:
+        def read_keys():
+            while True:
+                ready, _, _ = select.select((terminal, wake_read), (), ())
+                if wake_read in ready:
+                    return
+                key = os.read(terminal, 1).lower()
+                if key == b"p" and not paused.is_set():
+                    paused.set()
+                    print("\nПауза: записи пропускаются · r — продолжить", file=sys.stderr, flush=True)
+                elif key == b"r" and paused.is_set():
+                    paused.clear()
+                    print("\nПродолжено", file=sys.stderr, flush=True)
+                elif not key:
+                    return
+
+        worker = threading.Thread(target=read_keys, daemon=True)
+        worker.start()
+        yield paused
+    finally:
+        if worker is not None:
+            os.write(wake_write, b"x")
+            worker.join()
+        try:
+            termios.tcsetattr(terminal, termios.TCSADRAIN, original)
+        finally:
+            os.close(terminal)
+            os.close(wake_read)
+            os.close(wake_write)
+
+
+def consume(stream, renderer, args, paused=None):
     for line in stream:
+        if paused is not None and paused.is_set():
+            continue
         if not line.strip():
             continue
         event = parse_line(line)
@@ -173,37 +239,38 @@ def run(args):
         and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     )
     renderer = Renderer(color, headers=sys.stdout.isatty() and not args.no_header, group_size=args.group_size)
-    if args.file == "-":
-        consume(sys.stdin, renderer, args)
-        return 0
+    with pause_controls(not args.once) as paused:
+        if args.file == "-":
+            consume(sys.stdin, renderer, args, paused)
+            return 0
 
-    tail = shutil.which("tail")
-    if tail is None:
-        raise OSError("команда tail не найдена; установите coreutils или передайте лог через stdin ('-')")
-    # Fail clearly on a bad initial path; tail -F handles subsequent rotations.
-    with open(args.file, "rb"):
-        pass
-    command = [tail, "-n", str(args.lines)]
-    if not args.once:
-        command.append("-F")
-    command.extend(["--", args.file])
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, encoding="utf-8", errors="replace",
-        # Only the parent handles Ctrl+C and reaps the follower.
-        start_new_session=True,
-    )
-    try:
-        consume(process.stdout, renderer, args)
-        return process.wait()
-    finally:
-        if process.poll() is None:
-            process.terminate()
+        tail = shutil.which("tail")
+        if tail is None:
+            raise OSError("команда tail не найдена; установите coreutils или передайте лог через stdin ('-')")
+        # Fail clearly on a bad initial path; tail -F handles subsequent rotations.
+        with open(args.file, "rb"):
+            pass
+        command = [tail, "-n", str(args.lines)]
+        if not args.once:
+            command.append("-F")
+        command.extend(["--", args.file])
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, encoding="utf-8", errors="replace",
+            # Only the parent handles Ctrl+C and reaps the follower.
+            start_new_session=True,
+        )
         try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-        process.stdout.close()
+            consume(process.stdout, renderer, args, paused)
+            return process.wait()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            process.stdout.close()
 
 
 def main():

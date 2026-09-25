@@ -57,47 +57,20 @@ def parse_line(line):
 class Renderer:
     USER_COLORS = ("96", "94", "95", "93", "92", "36", "35")
 
-    def __init__(self, color, one_line=False, headers=True):
+    def __init__(self, color):
         self.color = color
-        self.one_line = one_line
-        self.headers = headers
-        self.date = None
 
     def paint(self, value, style):
         return "\033[{}m{}\033[0m".format(style, value) if self.color else value
 
-    def banner(self, source):
-        if self.headers:
-            print(self.paint("XRAY / ACCESS LIVE", "1;96"), flush=True)
-            print(self.paint("  {}  ·  Ctrl+C to stop".format(safe_text(source)), "2"), flush=True)
-
     def render(self, event):
-        if self.headers and self.date != event.date:
-            print(self.paint("── {} ──".format(event.date), "2"), flush=True)
-            self.date = event.date
-
-        # Keep full timestamp precision and endpoint/user text; never truncate.
-        timestamp = event.time if self.headers else event.date + " " + event.time
         user_color = self.USER_COLORS[zlib.crc32(event.user.encode("utf-8")) % len(self.USER_COLORS)]
         route_color = "92" if event.route.casefold() == "direct" else "95"
         if event.route.casefold() in ("block", "blocked", "blackhole"):
             route_color = "91"
         user = self.paint(event.user, "1;" + user_color)
         route = self.paint("[{}]".format(event.route), "1;" + route_color)
-        protocol = self.paint(event.protocol.upper(), "93" if event.protocol == "udp" else "96")
-        source = self.paint(event.source, "37")
-        destination = self.paint(event.destination, "1;97")
-        status = self.paint("REJECTED", "1;91") if event.status == "rejected" else ""
-        inbound = self.paint("in: " + event.inbound, "2")
-        headline = "{}  {}  {}{}".format(
-            self.paint(timestamp, "2"), user, route, "  " + status if status else ""
-        )
-        connection = "{}  {} → {}  ·  {}".format(protocol, source, destination, inbound)
-        separator = "  │  " if self.one_line else "\n    "
-        print(headline + separator + connection, flush=True)
-
-    def unknown(self, line):
-        print(self.paint("UNPARSED", "93") + "  " + safe_text(line.rstrip("\r\n")), flush=True)
+        print("{}  {}".format(user, route), flush=True)
 
 
 def nonnegative(value):
@@ -112,7 +85,7 @@ def nonnegative(value):
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="Цветной просмотр Xray access.log в реальном времени.",
+        description="Xray access.log в реальном времени: только имя пользователя и route.",
         epilog="Пример: tail -F /usr/local/x-ui/access.log | %(prog)s -",
     )
     parser.add_argument("file", nargs="?", default=DEFAULT_LOG, help="путь к логу; '-' — stdin (по умолчанию: %(default)s)")
@@ -120,9 +93,10 @@ def arguments(argv=None):
     parser.add_argument("--once", action="store_true", help="вывести последние N строк файла и завершиться")
     parser.add_argument("--user", metavar="TEXT", help="часть имени пользователя, без учёта регистра")
     parser.add_argument("--route", metavar="NAME", help="точное имя маршрута, например direct или lobasto-v6")
-    parser.add_argument("--one-line", action="store_true", help="одно подключение на строку для широкого терминала")
+    # Retain old flags as no-ops for existing shell commands.
+    parser.add_argument("--one-line", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="цвет ANSI (по умолчанию: %(default)s; учитывает NO_COLOR)")
-    parser.add_argument("--no-header", action="store_true", help="без заголовков, дата в каждой записи")
+    parser.add_argument("--no-header", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -132,8 +106,7 @@ def consume(stream, renderer, args):
             continue
         event = parse_line(line)
         if event is None:
-            # Unknown formats remain visible, including rejected/error records.
-            renderer.unknown(line)
+            # Only parsed user/route pairs belong in the output.
             continue
         if args.user and args.user.casefold() not in event.user.casefold():
             continue
@@ -147,9 +120,8 @@ def run(args):
         args.color == "auto" and sys.stdout.isatty()
         and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     )
-    renderer = Renderer(color, args.one_line, sys.stdout.isatty() and not args.no_header)
+    renderer = Renderer(color)
     if args.file == "-":
-        renderer.banner("stdin")
         consume(sys.stdin, renderer, args)
         return 0
 
@@ -163,7 +135,6 @@ def run(args):
     if not args.once:
         command.append("-F")
     command.extend(["--", args.file])
-    renderer.banner(args.file)
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, encoding="utf-8", errors="replace",
         # Only the parent handles Ctrl+C and reaps the follower.

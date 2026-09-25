@@ -81,7 +81,7 @@ def column_lines(value, width):
 
 class Renderer:
     USER_COLORS = ("96", "94", "95", "93", "92", "36", "35")
-    WIDTHS = (26, 32, 18)
+    WIDTHS = (26, 32, 18, 24)
 
     def __init__(self, color, headers=False):
         self.color = color
@@ -94,7 +94,7 @@ class Renderer:
     def render(self, event):
         if self.headers and not self.header_printed:
             labels = [column_lines(label, width)[0] for label, width in zip(
-                ("DATE / TIME", "USER", "ROUTE"), self.WIDTHS
+                ("DATE / TIME", "USER", "ROUTE", "SOURCE"), self.WIDTHS
             )]
             print(self.paint("  ".join(labels) + "    DESTINATION", "1;2"), flush=True)
             self.header_printed = True
@@ -102,15 +102,15 @@ class Renderer:
         route_color = "92" if event.route.casefold() == "direct" else "95"
         if event.route.casefold() in ("block", "blocked", "blackhole"):
             route_color = "91"
-        values = (event.date + " " + event.time, event.user, "[{}]".format(event.route))
+        values = (event.date + " " + event.time, event.user, "[{}]".format(event.route), event.source)
         columns = [column_lines(value, width) for value, width in zip(values, self.WIDTHS)]
         rows = []
         for index, cells in enumerate(zip_longest(*columns, fillvalue="")):
-            timestamp, user, route = [
+            timestamp, user, route, source = [
                 cell or " " * width for cell, width in zip(cells, self.WIDTHS)
             ]
             row = "  ".join((self.paint(timestamp, "2"), self.paint(user, "1;" + user_color),
-                             self.paint(route, "1;" + route_color)))
+                             self.paint(route, "1;" + route_color), self.paint(source, "36")))
             if index == 0:
                 row += "  " + self.paint("→", "96") + " " + self.paint(event.destination, "1;97")
             rows.append(row)
@@ -129,7 +129,7 @@ def nonnegative(value):
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="Xray access.log колонками: дата, пользователь, route → назначение.",
+        description="Xray access.log колонками: дата, пользователь, route, источник → назначение.",
         epilog="Пример: tail -F /usr/local/x-ui/access.log | %(prog)s -",
     )
     parser.add_argument("file", nargs="?", default=DEFAULT_LOG, help="путь к логу; '-' — stdin (по умолчанию: %(default)s)")

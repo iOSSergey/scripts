@@ -10,6 +10,7 @@ import sys
 import unicodedata
 import zlib
 from dataclasses import dataclass
+from itertools import zip_longest
 
 
 DEFAULT_LOG = "/usr/local/x-ui/access.log"
@@ -54,23 +55,66 @@ def parse_line(line):
     return Event(**{key: safe_text(value.strip()) for key, value in fields.items()})
 
 
+def cell_width(value):
+    return sum(
+        0 if unicodedata.combining(char) else
+        2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        for char in value
+    )
+
+
+def column_lines(value, width):
+    """Wrap long values instead of moving subsequent columns or losing text."""
+    lines = []
+    current = ""
+    used = 0
+    for char in value:
+        size = cell_width(char)
+        if used + size > width:
+            lines.append(current)
+            current, used = "", 0
+        current += char
+        used += size
+    lines.append(current)
+    return [line + " " * (width - cell_width(line)) for line in lines]
+
+
 class Renderer:
     USER_COLORS = ("96", "94", "95", "93", "92", "36", "35")
+    WIDTHS = (26, 32, 18)
 
-    def __init__(self, color):
+    def __init__(self, color, headers=False):
         self.color = color
+        self.headers = headers
+        self.header_printed = False
 
     def paint(self, value, style):
         return "\033[{}m{}\033[0m".format(style, value) if self.color else value
 
     def render(self, event):
+        if self.headers and not self.header_printed:
+            labels = [column_lines(label, width)[0] for label, width in zip(
+                ("DATE / TIME", "USER", "ROUTE"), self.WIDTHS
+            )]
+            print(self.paint("  ".join(labels) + "    DESTINATION", "1;2"), flush=True)
+            self.header_printed = True
         user_color = self.USER_COLORS[zlib.crc32(event.user.encode("utf-8")) % len(self.USER_COLORS)]
         route_color = "92" if event.route.casefold() == "direct" else "95"
         if event.route.casefold() in ("block", "blocked", "blackhole"):
             route_color = "91"
-        user = self.paint(event.user, "1;" + user_color)
-        route = self.paint("[{}]".format(event.route), "1;" + route_color)
-        print("{}  {}".format(user, route), flush=True)
+        values = (event.date + " " + event.time, event.user, "[{}]".format(event.route))
+        columns = [column_lines(value, width) for value, width in zip(values, self.WIDTHS)]
+        rows = []
+        for index, cells in enumerate(zip_longest(*columns, fillvalue="")):
+            timestamp, user, route = [
+                cell or " " * width for cell, width in zip(cells, self.WIDTHS)
+            ]
+            row = "  ".join((self.paint(timestamp, "2"), self.paint(user, "1;" + user_color),
+                             self.paint(route, "1;" + route_color)))
+            if index == 0:
+                row += "  " + self.paint("→", "96") + " " + self.paint(event.destination, "1;97")
+            rows.append(row)
+        print("\n".join(rows), flush=True)
 
 
 def nonnegative(value):
@@ -85,7 +129,7 @@ def nonnegative(value):
 
 def arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="Xray access.log в реальном времени: только имя пользователя и route.",
+        description="Xray access.log колонками: дата, пользователь, route → назначение.",
         epilog="Пример: tail -F /usr/local/x-ui/access.log | %(prog)s -",
     )
     parser.add_argument("file", nargs="?", default=DEFAULT_LOG, help="путь к логу; '-' — stdin (по умолчанию: %(default)s)")
@@ -93,10 +137,10 @@ def arguments(argv=None):
     parser.add_argument("--once", action="store_true", help="вывести последние N строк файла и завершиться")
     parser.add_argument("--user", metavar="TEXT", help="часть имени пользователя, без учёта регистра")
     parser.add_argument("--route", metavar="NAME", help="точное имя маршрута, например direct или lobasto-v6")
-    # Retain old flags as no-ops for existing shell commands.
+    # Retain the old flag for existing shell commands.
     parser.add_argument("--one-line", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="цвет ANSI (по умолчанию: %(default)s; учитывает NO_COLOR)")
-    parser.add_argument("--no-header", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-header", action="store_true", help="не выводить заголовки колонок")
     return parser.parse_args(argv)
 
 
@@ -106,7 +150,7 @@ def consume(stream, renderer, args):
             continue
         event = parse_line(line)
         if event is None:
-            # Only parsed user/route pairs belong in the output.
+            # Only parsed access events belong in the output.
             continue
         if args.user and args.user.casefold() not in event.user.casefold():
             continue
@@ -120,7 +164,7 @@ def run(args):
         args.color == "auto" and sys.stdout.isatty()
         and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     )
-    renderer = Renderer(color)
+    renderer = Renderer(color, headers=sys.stdout.isatty() and not args.no_header)
     if args.file == "-":
         consume(sys.stdin, renderer, args)
         return 0

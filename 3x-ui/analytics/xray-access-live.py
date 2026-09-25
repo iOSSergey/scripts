@@ -157,7 +157,7 @@ def arguments(argv=None):
 
 @contextmanager
 def pause_controls(enabled=True):
-    """Read p/r/Space from the terminal, independently of the log's input stream."""
+    """Toggle pause with Space, independently of the log's input stream."""
     if not enabled:
         yield None
         return
@@ -189,13 +189,14 @@ def pause_controls(enabled=True):
                 ready, _, _ = select.select((terminal, wake_read), (), ())
                 if wake_read in ready:
                     return
-                key = os.read(terminal, 1).lower()
-                if key == b"p" and not paused.is_set():
-                    paused.set()
-                    print("\nPaused. New events get dropped. Hit Space when you're done staring.", file=sys.stderr, flush=True)
-                elif key in (b"r", b" ") and paused.is_set():
-                    paused.clear()
-                    print("\nResumed.", file=sys.stderr, flush=True)
+                key = os.read(terminal, 1)
+                if key == b" ":
+                    if paused.is_set():
+                        paused.clear()
+                        print("\nRUNNING | Space: pause", file=sys.stderr, flush=True)
+                    else:
+                        paused.set()
+                        print("\nPAUSED | Space: resume | events dropped", file=sys.stderr, flush=True)
                 elif not key:
                     return
 

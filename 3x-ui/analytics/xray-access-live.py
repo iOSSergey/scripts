@@ -83,15 +83,19 @@ class Renderer:
     USER_COLORS = ("96", "94", "95", "93", "92", "36", "35")
     WIDTHS = (26, 32, 18, 24)
 
-    def __init__(self, color, headers=False):
+    def __init__(self, color, headers=False, group_size=10):
         self.color = color
         self.headers = headers
         self.header_printed = False
+        self.group_size = group_size
+        self.events_printed = 0
 
     def paint(self, value, style):
         return "\033[{}m{}\033[0m".format(style, value) if self.color else value
 
     def render(self, event):
+        if self.group_size and self.events_printed and self.events_printed % self.group_size == 0:
+            print(flush=True)
         if self.headers and not self.header_printed:
             labels = [column_lines(label, width)[0] for label, width in zip(
                 ("DATE / TIME", "USER", "ROUTE", "SOURCE"), self.WIDTHS
@@ -115,6 +119,7 @@ class Renderer:
                 row += "  " + self.paint("→", "96") + " " + self.paint(event.destination, "1;97")
             rows.append(row)
         print("\n".join(rows), flush=True)
+        self.events_printed += 1
 
 
 def nonnegative(value):
@@ -137,6 +142,7 @@ def arguments(argv=None):
     parser.add_argument("--once", action="store_true", help="вывести последние N строк файла и завершиться")
     parser.add_argument("--user", metavar="TEXT", help="часть имени пользователя, без учёта регистра")
     parser.add_argument("--route", metavar="NAME", help="точное имя маршрута, например direct или lobasto-v6")
+    parser.add_argument("--group-size", type=nonnegative, default=10, metavar="N", help="пустая строка между блоками из N подключений; 1 — между всеми, 0 — без промежутков (по умолчанию: %(default)s)")
     # Retain the old flag for existing shell commands.
     parser.add_argument("--one-line", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--color", choices=("auto", "always", "never"), default="auto", help="цвет ANSI (по умолчанию: %(default)s; учитывает NO_COLOR)")
@@ -152,6 +158,8 @@ def consume(stream, renderer, args):
         if event is None:
             # Only parsed access events belong in the output.
             continue
+        if event.route.casefold() == "api":
+            continue
         if args.user and args.user.casefold() not in event.user.casefold():
             continue
         if args.route and args.route != event.route:
@@ -164,7 +172,7 @@ def run(args):
         args.color == "auto" and sys.stdout.isatty()
         and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb"
     )
-    renderer = Renderer(color, headers=sys.stdout.isatty() and not args.no_header)
+    renderer = Renderer(color, headers=sys.stdout.isatty() and not args.no_header, group_size=args.group_size)
     if args.file == "-":
         consume(sys.stdin, renderer, args)
         return 0

@@ -7,6 +7,7 @@ import os
 import re
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import termios
@@ -155,9 +156,13 @@ def arguments(argv=None):
     return parser.parse_args(argv)
 
 
+class QuitRequested(Exception):
+    """The user requested a clean exit from the terminal."""
+
+
 @contextmanager
 def pause_controls(enabled=True):
-    """Toggle pause with Space, independently of the log's input stream."""
+    """Read pause/resume/quit keys independently of the log's input stream."""
     if not enabled:
         yield None
         return
@@ -182,6 +187,7 @@ def pause_controls(enabled=True):
         yield None
         return
     paused = threading.Event()
+    quit_requested = threading.Event()
     worker = None
     try:
         def read_keys():
@@ -189,20 +195,27 @@ def pause_controls(enabled=True):
                 ready, _, _ = select.select((terminal, wake_read), (), ())
                 if wake_read in ready:
                     return
-                key = os.read(terminal, 1)
-                if key == b" ":
-                    if paused.is_set():
-                        paused.clear()
-                        print("\nRUNNING | Space: pause", file=sys.stderr, flush=True)
-                    else:
-                        paused.set()
-                        print("\nPAUSED | Space: resume | events dropped", file=sys.stderr, flush=True)
-                elif not key:
+                key = os.read(terminal, 1).lower()
+                if not key:
                     return
+                if key == b"q":
+                    quit_requested.set()
+                    # Interrupt even an idle log read; normal cleanup reaps tail.
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+                if paused.is_set():
+                    paused.clear()
+                elif key == b"p":
+                    paused.set()
+                    print("\nPress any key to continue...", file=sys.stderr, flush=True)
 
         worker = threading.Thread(target=read_keys, daemon=True)
         worker.start()
         yield paused
+    except KeyboardInterrupt:
+        if quit_requested.is_set():
+            raise QuitRequested() from None
+        raise
     finally:
         if worker is not None:
             os.write(wake_write, b"x")
@@ -280,6 +293,8 @@ def main():
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     try:
         return run(args)
+    except QuitRequested:
+        return 0
     except KeyboardInterrupt:
         return 130
     except BrokenPipeError:

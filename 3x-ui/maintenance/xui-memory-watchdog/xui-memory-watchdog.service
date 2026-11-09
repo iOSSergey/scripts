@@ -1,0 +1,15 @@
+[Unit]
+Description=X-UI Memory Watchdog
+After=x-ui.service
+Wants=x-ui.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/xui-memory-watchdog
+ExecStart=/usr/local/sbin/xui-memory-watchdog
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

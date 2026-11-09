@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+
+set -u
+
+LOG="${LOG:-/var/log/xui-memory-watchdog.log}"
+STATE="${STATE:-/run/xui-memory-watchdog.last-restart}"
+CGROUP_PATH="${CGROUP_PATH:-/sys/fs/cgroup/system.slice/x-ui.service}"
+
+NORMAL_AVAILABLE_MIB="${NORMAL_AVAILABLE_MIB:-80}"
+CRITICAL_AVAILABLE_MIB="${CRITICAL_AVAILABLE_MIB:-40}"
+CHECK_INTERVAL="${CHECK_INTERVAL:-5}"
+NORMAL_COUNT_REQUIRED="${NORMAL_COUNT_REQUIRED:-3}"
+COOLDOWN="${COOLDOWN:-600}"
+
+require_positive_integer() {
+    local name="$1"
+    local value="$2"
+
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'Invalid %s=%q: expected a positive integer\n' "$name" "$value" >&2
+        exit 2
+    fi
+}
+
+require_positive_integer NORMAL_AVAILABLE_MIB "$NORMAL_AVAILABLE_MIB"
+require_positive_integer CRITICAL_AVAILABLE_MIB "$CRITICAL_AVAILABLE_MIB"
+require_positive_integer CHECK_INTERVAL "$CHECK_INTERVAL"
+require_positive_integer NORMAL_COUNT_REQUIRED "$NORMAL_COUNT_REQUIRED"
+require_positive_integer COOLDOWN "$COOLDOWN"
+
+if (( CRITICAL_AVAILABLE_MIB > NORMAL_AVAILABLE_MIB )); then
+    printf 'CRITICAL_AVAILABLE_MIB must not exceed NORMAL_AVAILABLE_MIB\n' >&2
+    exit 2
+fi
+
+NORMAL_AVAILABLE_KB=$((NORMAL_AVAILABLE_MIB * 1024))
+CRITICAL_AVAILABLE_KB=$((CRITICAL_AVAILABLE_MIB * 1024))
+low_count=0
+
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"
+}
+
+get_available_kb() {
+    awk '/^MemAvailable:/ {print $2}' /proc/meminfo
+}
+
+get_total_kb() {
+    awk '/^MemTotal:/ {print $2}' /proc/meminfo
+}
+
+memory_stat_mib() {
+    local key="$1"
+    local stat="$CGROUP_PATH/memory.stat"
+
+    if [[ -r "$stat" ]]; then
+        awk -v key="$key" '
+            $1 == key {
+                printf "%.1f", $2 / 1048576
+                found=1
+            }
+            END {
+                if (!found) printf "0.0"
+            }
+        ' "$stat"
+    else
+        printf 'N/A'
+    fi
+}
+
+log_cgroup_memory() {
+    if [[ ! -r "$CGROUP_PATH/memory.stat" ]]; then
+        log "Cgroup memory.stat unavailable"
+        return
+    fi
+
+    log "CGROUP memory:"
+    log "  anon=$(memory_stat_mib anon)MiB file=$(memory_stat_mib file)MiB"
+    log "  kernel=$(memory_stat_mib kernel)MiB sock=$(memory_stat_mib sock)MiB"
+    log "  slab=$(memory_stat_mib slab)MiB pagetables=$(memory_stat_mib pagetables)MiB"
+}
+
+log_tcp_diagnostics() {
+    local pid="$1"
+    local tmp
+
+    if [[ -z "$pid" ]]; then
+        log "TCP diagnostics: Xray PID unavailable"
+        return
+    fi
+
+    tmp=$(mktemp)
+
+    ss -Htanp 2>/dev/null |
+        awk -v needle="pid=$pid," '
+            index($0, needle) {
+                print $1 "|" $5
+            }
+        ' > "$tmp"
+
+    if [[ ! -s "$tmp" ]]; then
+        log "TCP states: none"
+        rm -f "$tmp"
+        return
+    fi
+
+    log "TCP states:"
+
+    awk -F'|' '
+        { count[$1]++ }
+        END {
+            for (state in count)
+                print state, count[state]
+        }
+    ' "$tmp" |
+        sort |
+        while read -r state count; do
+            log "  $state=$count"
+        done
+
+    log "Top remote peers:"
+
+    cut -d'|' -f2 "$tmp" |
+        sort |
+        uniq -c |
+        sort -nr |
+        awk 'NR <= 10' |
+        while read -r count peer; do
+            log "  $count $peer"
+        done
+
+    rm -f "$tmp"
+}
+
+restart_xui() {
+    local reason="$1"
+    local available_kb total_kb used_kb
+    local cgroup_bytes cgroup_mib
+    local xray_pid xray_rss xui_pid xui_rss
+    local fd_count tcp_count
+
+    # Optional bounded diagnostics hook. The watchdog works without it.
+    if [[ -x /usr/local/sbin/xui-memory-diagnostics ]]; then
+        timeout --signal=TERM --kill-after=1s 2s /usr/bin/python3 \
+            /usr/local/sbin/xui-memory-diagnostics --event --reason "watchdog: $reason" \
+            >/dev/null 2>&1 || true
+    fi
+
+    available_kb=$(get_available_kb)
+    total_kb=$(get_total_kb)
+    used_kb=$((total_kb - available_kb))
+
+    cgroup_bytes=$(systemctl show x-ui -p MemoryCurrent --value 2>/dev/null)
+    if [[ "$cgroup_bytes" =~ ^[0-9]+$ ]]; then
+        cgroup_mib=$((cgroup_bytes / 1024 / 1024))
+    else
+        cgroup_mib="unknown"
+    fi
+
+    xray_pid=$(pgrep -f 'xray-linux-amd64' | head -1)
+    xui_pid=$(pgrep -x x-ui | head -1)
+    xray_rss=0
+    xui_rss=0
+    fd_count=0
+    tcp_count=0
+
+    if [[ -n "$xray_pid" && -r "/proc/$xray_pid/status" ]]; then
+        xray_rss=$(awk '/^VmRSS:/ {print int($2/1024)}' "/proc/$xray_pid/status")
+        fd_count=$(find "/proc/$xray_pid/fd" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+        tcp_count=$(ss -Htanp 2>/dev/null | grep -c "pid=$xray_pid," || true)
+    fi
+
+    if [[ -n "$xui_pid" && -r "/proc/$xui_pid/status" ]]; then
+        xui_rss=$(awk '/^VmRSS:/ {print int($2/1024)}' "/proc/$xui_pid/status")
+    fi
+
+    log "===== TRIGGER ====="
+    log "Reason: $reason"
+    log "RAM used=$((used_kb/1024))MiB available=$((available_kb/1024))MiB total=$((total_kb/1024))MiB"
+    log "x-ui.service MemoryCurrent=${cgroup_mib}MiB"
+    log "xray PID=${xray_pid:-none} RSS=${xray_rss}MiB FD=${fd_count} TCP=${tcp_count}"
+    log "x-ui PID=${xui_pid:-none} RSS=${xui_rss}MiB"
+    log_cgroup_memory
+    log_tcp_diagnostics "$xray_pid"
+    log "Restarting x-ui.service"
+
+    if systemctl restart x-ui; then
+        date +%s > "$STATE"
+        sleep 10
+
+        available_kb=$(get_available_kb)
+        total_kb=$(get_total_kb)
+        used_kb=$((total_kb - available_kb))
+        cgroup_bytes=$(systemctl show x-ui -p MemoryCurrent --value 2>/dev/null)
+
+        if [[ "$cgroup_bytes" =~ ^[0-9]+$ ]]; then
+            cgroup_mib=$((cgroup_bytes / 1024 / 1024))
+        else
+            cgroup_mib="unknown"
+        fi
+
+        log "Restart successful"
+        log "After restart: RAM used=$((used_kb/1024))MiB available=$((available_kb/1024))MiB x-ui.service=${cgroup_mib}MiB"
+    else
+        log "ERROR: systemctl restart x-ui failed"
+    fi
+
+    log "==================="
+}
+
+if [[ "${1:-}" == "--check-config" ]]; then
+    printf 'normal=%sMiB critical=%sMiB interval=%ss count=%s cooldown=%ss\n' \
+        "$NORMAL_AVAILABLE_MIB" "$CRITICAL_AVAILABLE_MIB" "$CHECK_INTERVAL" \
+        "$NORMAL_COUNT_REQUIRED" "$COOLDOWN"
+    exit 0
+fi
+
+if [[ $# -ne 0 ]]; then
+    printf 'Usage: %s [--check-config]\n' "$0" >&2
+    exit 2
+fi
+
+log "Watchdog started: normal=${NORMAL_AVAILABLE_MIB}MiB critical=${CRITICAL_AVAILABLE_MIB}MiB"
+
+while true; do
+    available_kb=$(get_available_kb)
+
+    if [[ -f "$STATE" ]]; then
+        last_restart=$(cat "$STATE" 2>/dev/null || echo 0)
+        now=$(date +%s)
+
+        if (( now - last_restart < COOLDOWN )); then
+            low_count=0
+            sleep "$CHECK_INTERVAL"
+            continue
+        fi
+    fi
+
+    if (( available_kb <= CRITICAL_AVAILABLE_KB )); then
+        restart_xui "CRITICAL MemAvailable=$((available_kb/1024))MiB"
+        low_count=0
+        sleep "$CHECK_INTERVAL"
+        continue
+    fi
+
+    if (( available_kb <= NORMAL_AVAILABLE_KB )); then
+        ((low_count++))
+    else
+        low_count=0
+    fi
+
+    if (( low_count >= NORMAL_COUNT_REQUIRED )); then
+        restart_xui "LOW MEMORY sustained $((CHECK_INTERVAL * NORMAL_COUNT_REQUIRED))s, MemAvailable=$((available_kb/1024))MiB"
+        low_count=0
+    fi
+
+    sleep "$CHECK_INTERVAL"
+done

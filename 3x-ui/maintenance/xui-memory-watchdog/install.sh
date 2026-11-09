@@ -60,6 +60,7 @@ fi
 
 install -Dm0755 "$SCRIPT_DIR/xui-memory-watchdog" /usr/local/sbin/xui-memory-watchdog
 install -Dm0644 "$SCRIPT_DIR/xui-memory-watchdog.service" /etc/systemd/system/xui-memory-watchdog.service
+install -Dm0755 "$SCRIPT_DIR/xui-watchdog-login.sh" /etc/profile.d/xui-watchdog-login.sh
 
 config_tmp=$(mktemp)
 trap 'rm -f "$config_tmp"' EXIT

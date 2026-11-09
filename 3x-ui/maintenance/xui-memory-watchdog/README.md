@@ -15,6 +15,9 @@ counts, cgroup memory categories, and the ten most common remote peers to
 `/var/log/xui-memory-watchdog.log`. If `/usr/local/sbin/xui-memory-diagnostics`
 is installed, it is invoked as an optional, time-bounded pre-restart hook.
 
+Interactive SSH sessions show the last ten watchdog log lines at login. The
+header separators automatically match the longest displayed line.
+
 ## Install
 
 Requirements: a systemd-based Linux host with `x-ui.service`, cgroup v2, Bash,
